@@ -11,7 +11,8 @@ from Pb2 import MajoRLoGinrEq_pb2, MajoRLoGinrEs_pb2, PorTs_pb2
 
 app = Flask(__name__)
 bots = {}
-user_sessions = {} # {uid: expiry_time}
+user_sessions = {}  # {uid: expiry_time (datetime)}
+loop = None  # will be set inside main()
 
 Hr = {
     "User-Agent": "fadai/1.0 (Linux; Android 13; SM-S918B Build/TP1A.220.624.014)",
@@ -26,6 +27,10 @@ Hr = {
 
 RIZERx = "1.126.9"
 
+
+# ============================================================
+#                  LOW-LEVEL LOGIN / CRYPTO
+# ============================================================
 async def GeNeRaTeAccEss(uid, password):
     url = "https://100067.connect.garena.com/oauth/guest/token/grant"
     headers = {
@@ -44,7 +49,8 @@ async def GeNeRaTeAccEss(uid, password):
         "client_id": "100067"
     }
     try:
-        async with aiohttp.ClientSession() as session:
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(url, headers=headers, data=data) as response:
                 if response.status == 200:
                     data = await response.json()
@@ -54,6 +60,7 @@ async def GeNeRaTeAccEss(uid, password):
     except Exception:
         pass
     return None, None
+
 
 async def EncRypTMajoRLoGin(open_id, access_token):
     major_login = MajoRLoGinrEq_pb2.MajorLogin()
@@ -116,6 +123,7 @@ async def EncRypTMajoRLoGin(open_id, access_token):
     string = major_login.SerializeToString()
     return await Encrypt_Proto(string)
 
+
 async def Encrypt_Proto(payload):
     key = b"Yg&tc%DEuh6%Zc^8"
     iv = b"6oyZDr22E3ychjM%"
@@ -123,21 +131,28 @@ async def Encrypt_Proto(payload):
     padded = pad(payload, AES.block_size)
     return cipher.encrypt(padded)
 
+
 async def MajorLogin(payload):
     url = "https://loginbp.ggpolarbear.com/MajorLogin"
     ssl_context = ssl.create_default_context()
     ssl_context.check_hostname = False
     ssl_context.verify_mode = ssl.CERT_NONE
-    async with aiohttp.ClientSession() as session:
-        async with session.post(url, data=payload, headers=Hr, ssl=ssl_context) as response:
-            if response.status == 200:
-                return await response.read()
-            return None
+    timeout = aiohttp.ClientTimeout(total=20)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(url, data=payload, headers=Hr, ssl=ssl_context) as response:
+                if response.status == 200:
+                    return await response.read()
+                return None
+    except Exception:
+        return None
+
 
 async def DecRypTMajoRLoGin(MajoRLoGinResPonsE):
     proto = MajoRLoGinrEs_pb2.MajorLoginRes()
     proto.ParseFromString(MajoRLoGinResPonsE)
     return proto
+
 
 async def GetLoginData(base_url, payload, token):
     url = f"{base_url}/GetLoginData"
@@ -146,16 +161,22 @@ async def GetLoginData(base_url, payload, token):
     ssl_context.verify_mode = ssl.CERT_NONE
     Hr_copy = Hr.copy()
     Hr_copy["Authorization"] = f"Bearer {token}"
-    async with aiohttp.ClientSession() as session:
-        async with session.post(url, data=payload, headers=Hr_copy, ssl=ssl_context) as response:
-            if response.status == 200:
-                return await response.read()
-            return None
+    timeout = aiohttp.ClientTimeout(total=20)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(url, data=payload, headers=Hr_copy, ssl=ssl_context) as response:
+                if response.status == 200:
+                    return await response.read()
+                return None
+    except Exception:
+        return None
+
 
 async def DecRypTLoGinDaTa(LoGinDaTa):
     proto = PorTs_pb2.GetLoginData()
     proto.ParseFromString(LoGinDaTa)
     return proto
+
 
 async def xAuThSTarTuP(TarGeT, token, timestamp, key, iv):
     uid_hex = hex(TarGeT)[2:]
@@ -170,6 +191,7 @@ async def xAuThSTarTuP(TarGeT, token, timestamp, key, iv):
     elif uid_length == 7: headers = "000000000"
     else: headers = "0000000"
     return f"0115{headers}{uid_hex}{encrypted_timestamp}00000{encrypted_packet_length}{encrypted_packet}"
+
 
 async def create_craftland_room_latest(key, iv):
     fields = {
@@ -190,16 +212,36 @@ async def create_craftland_room_latest(key, iv):
     proto_hex = (await CrEaTe_ProTo(fields)).hex()
     return await GeneRaTePk(proto_hex, "0E15", key, iv)
 
+
 async def create_invite_packet(target_uid, key, iv):
     fields = {1: 22, 2: {1: int(target_uid)}}
     proto_hex = (await CrEaTe_ProTo(fields)).hex()
     return await GeneRaTePk(proto_hex, "0E15", key, iv)
 
+
 async def send_keep_alive(key, iv):
     fields = {1: 99, 2: {1: int(time.time()), 2: 1}}
     return await GeneRaTePk((await CrEaTe_ProTo(fields)).hex(), "0515", key, iv)
 
+
+# ============================================================
+#                          BOT
+# ============================================================
 class Bot:
+    """
+    Persistent Free-Fire bot.
+
+    Architecture (fixed):
+      • supervisor()  : runs FOREVER. It restarts the login/connection whenever
+                        the socket dies, no matter the reason. Never gives up.
+      • spam_loop()   : runs FOREVER while the bot object exists. It only sends
+                        invites when (a) socket is up AND (b) a spam_target exists
+                        AND (c) that target's 30-minute session is still valid.
+                        It NEVER exits on socket drop – it just waits and resumes.
+    So calling /xAyOuB just sets spam_target + expiry and the loop takes care
+    of the rest, including through unlimited disconnections.
+    """
+
     def __init__(self, uid, password):
         self.uid = uid
         self.password = password
@@ -220,18 +262,26 @@ class Bot:
         self.chat_port = None
         self.account_name = ""
         self.connected = False
-        self.spamming = False
-        self.spam_target = None
-        self.spam_count = 10
-        self.keep_alive_task = None
-        self.read_task = None
+        self.spam_target = None    # current target uid (str) or None
+        self.account_name = ""
         self.login_data = None
         self.payload = None
         self.open_id = None
         self.access_token = None
         self.room_opened = False
+        self.total_sent = 0
+        self.total_failed = 0
+        self.last_send_ts = 0
+        # Tasks
+        self.supervisor_task = None
+        self.spam_task = None
+        self.read_task = None
+        self.keep_alive_task = None
+        # Event: set whenever we are fully connected and ready to send
+        self.ready_event = asyncio.Event()
         self._lock = asyncio.Lock()
 
+    # ---------------- LOGIN ----------------
     async def do_login(self):
         for attempt in range(5):
             try:
@@ -267,86 +317,86 @@ class Bot:
                 self.chat_ip, self.chat_port = self.login_data.AccountIP_Port.split(":")
                 self.account_name = getattr(self.login_data, "AccountName", "Bot")
                 self.auth_token = await xAuThSTarTuP(int(self.tarGeT), self.token, int(self.timestamp), self.key, self.iv)
-                print(f"Bot {self.uid}: Login OK | UID={self.tarGeT} | Region={self.region} | Name={self.account_name}")
+                print(f"[{self.uid}] LOGIN OK  uid={self.tarGeT} region={self.region} name={self.account_name}")
                 return True
             except Exception as e:
-                print(f"Bot {self.uid}: Login attempt {attempt+1} error: {e}")
+                print(f"[{self.uid}] Login attempt {attempt+1} error: {e}")
                 await asyncio.sleep(1)
         return False
 
-    async def reconnect_auth(self):
+    async def refresh_auth(self):
+        """Refresh MajorLogin (short) to get a new session-key without full oauth re-fetch."""
         try:
             if not self.payload:
                 return await self.do_login()
             ml_response = await MajorLogin(self.payload)
             if not ml_response:
-                self.open_id, self.access_token = await GeNeRaTeAccEss(self.uid, self.password)
-                if not self.open_id or not self.access_token:
-                    return False
-                self.payload = await EncRypTMajoRLoGin(self.open_id, self.access_token)
-                ml_response = await MajorLogin(self.payload)
-                if not ml_response:
-                    return False
-                ml_auth = await DecRypTMajoRLoGin(ml_response)
-                self.tarGeT = ml_auth.account_uid
-                self.token = ml_auth.token
-                self.region = getattr(ml_auth, "region", "BD")
+                # full re-login
+                return await self.do_login()
+            ml_auth = await DecRypTMajoRLoGin(ml_response)
+            if not getattr(ml_auth, "token", None):
+                return await self.do_login()
+            self.tarGeT = ml_auth.account_uid or self.tarGeT
+            self.token = ml_auth.token
+            self.timestamp = ml_auth.timestamp
+            self.key = ml_auth.key
+            self.iv = ml_auth.iv
+            self.region = getattr(ml_auth, "region", self.region)
+            # refresh IP:port too when server gives one
+            try:
                 url = ml_auth.url
-                self.key = ml_auth.key
-                self.iv = ml_auth.iv
-                self.timestamp = ml_auth.timestamp
                 login_data_enc = await GetLoginData(url, self.payload, self.token)
-                if not login_data_enc:
-                    return False
-                self.login_data = await DecRypTLoGinDaTa(login_data_enc)
-                self.online_ip, self.online_port = self.login_data.Online_IP_Port.split(":")
-                self.chat_ip, self.chat_port = self.login_data.AccountIP_Port.split(":")
-                self.account_name = getattr(self.login_data, "AccountName", "Bot")
-                self.auth_token = await xAuThSTarTuP(int(self.tarGeT), self.token, int(self.timestamp), self.key, self.iv)
-            else:
-                ml_auth = await DecRypTMajoRLoGin(ml_response)
-                self.token = ml_auth.token
-                self.timestamp = ml_auth.timestamp
-                self.key = ml_auth.key
-                self.iv = ml_auth.iv
-                self.auth_token = await xAuThSTarTuP(int(self.tarGeT), self.token, int(self.timestamp), self.key, self.iv)
+                if login_data_enc:
+                    self.login_data = await DecRypTLoGinDaTa(login_data_enc)
+                    self.online_ip, self.online_port = self.login_data.Online_IP_Port.split(":")
+                    self.chat_ip, self.chat_port = self.login_data.AccountIP_Port.split(":")
+                    self.account_name = getattr(self.login_data, "AccountName", self.account_name)
+            except Exception:
+                pass
+            self.auth_token = await xAuThSTarTuP(int(self.tarGeT), self.token, int(self.timestamp), self.key, self.iv)
             return True
         except Exception as e:
-            print(f"Bot {self.uid}: Reconnect auth error: {e}")
-            return False
+            print(f"[{self.uid}] refresh_auth error: {e}")
+            return await self.do_login()
 
+    # ---------------- TCP ----------------
     async def connect_tcp(self):
         await self.disconnect_tcp()
-        for attempt in range(10):
+        try:
+            self.online_reader, self.online_writer = await asyncio.wait_for(
+                asyncio.open_connection(self.online_ip, int(self.online_port)), timeout=15
+            )
+            self.online_writer.write(bytes.fromhex(self.auth_token))
+            await self.online_writer.drain()
+            print(f"[{self.uid}] Online connected {self.online_ip}:{self.online_port}")
             try:
-                self.online_reader, self.online_writer = await asyncio.wait_for(
-                    asyncio.open_connection(self.online_ip, int(self.online_port)), timeout=15
+                self.whisper_reader, self.whisper_writer = await asyncio.wait_for(
+                    asyncio.open_connection(self.chat_ip, int(self.chat_port)), timeout=15
                 )
-                self.online_writer.write(bytes.fromhex(self.auth_token))
-                await self.online_writer.drain()
-                print(f"Bot {self.uid}: Online connected to {self.online_ip}:{self.online_port}")
-                try:
-                    self.whisper_reader, self.whisper_writer = await asyncio.wait_for(
-                        asyncio.open_connection(self.chat_ip, int(self.chat_port)), timeout=15
-                    )
-                    self.whisper_writer.write(bytes.fromhex(self.auth_token))
-                    await self.whisper_writer.drain()
-                    print(f"Bot {self.uid}: Chat connected to {self.chat_ip}:{self.chat_port}")
-                except Exception as e:
-                    print(f"Bot {self.uid}: Chat connection skipped: {e}")
-                    self.whisper_reader = None
-                    self.whisper_writer = None
-                self.connected = True
-                self.read_task = asyncio.create_task(self.read_loop())
-                self.keep_alive_task = asyncio.create_task(self.keep_alive_loop())
-                return True
+                self.whisper_writer.write(bytes.fromhex(self.auth_token))
+                await self.whisper_writer.drain()
+                print(f"[{self.uid}] Chat connected {self.chat_ip}:{self.chat_port}")
             except Exception as e:
-                print(f"Bot {self.uid}: TCP connect attempt {attempt+1} failed: {e}")
-                await asyncio.sleep(0.5)
-        return False
+                print(f"[{self.uid}] Chat connection skipped: {e}")
+                self.whisper_reader = None
+                self.whisper_writer = None
+            self.connected = True
+            self.room_opened = False
+            # Spawn per-connection helpers
+            self.read_task = asyncio.create_task(self.read_loop())
+            self.keep_alive_task = asyncio.create_task(self.keep_alive_loop())
+            self.ready_event.set()
+            return True
+        except Exception as e:
+            print(f"[{self.uid}] TCP connect failed: {e}")
+            self.connected = False
+            self.ready_event.clear()
+            return False
 
     async def disconnect_tcp(self):
         self.connected = False
+        self.room_opened = False
+        self.ready_event.clear()
         for task_attr in ["read_task", "keep_alive_task"]:
             task = getattr(self, task_attr, None)
             if task and not task.done():
@@ -359,115 +409,60 @@ class Bot:
             if writer:
                 try:
                     writer.close()
-                    await writer.wait_closed()
+                    try:
+                        await asyncio.wait_for(writer.wait_closed(), timeout=3)
+                    except Exception:
+                        pass
                 except Exception:
                     pass
         self.online_writer = None
         self.online_reader = None
         self.whisper_writer = None
         self.whisper_reader = None
-        await asyncio.sleep(0.1)
+        await asyncio.sleep(0.05)
 
     async def read_loop(self):
         try:
             while self.connected:
                 try:
-                    data = await asyncio.wait_for(self.online_reader.read(8192), timeout=60)
+                    data = await asyncio.wait_for(self.online_reader.read(8192), timeout=90)
                     if not data:
-                        print(f"Bot {self.uid}: Connection closed by server (read 0)")
-                        asyncio.create_task(self.handle_disconnect())
+                        # peer closed
+                        print(f"[{self.uid}] read: peer closed")
                         break
                 except asyncio.TimeoutError:
                     continue
                 except Exception as e:
-                    if self.connected:
-                        print(f"Bot {self.uid}: Read error: {e}")
-                        asyncio.create_task(self.handle_disconnect())
+                    print(f"[{self.uid}] read error: {e}")
                     break
         except asyncio.CancelledError:
             pass
-        except Exception as e:
-            if self.connected:
-                print(f"Bot {self.uid}: Read loop error: {e}")
-                asyncio.create_task(self.handle_disconnect())
+        finally:
+            # Signal the supervisor: socket is dead.
+            self.connected = False
+            self.ready_event.clear()
 
     async def keep_alive_loop(self):
         try:
             while self.connected:
                 try:
-                    await asyncio.sleep(25)
-                    if not self.connected:
+                    await asyncio.sleep(20)
+                    if not self.connected or not self.online_writer:
                         break
                     ka_packet = await send_keep_alive(self.key, self.iv)
-                    if self.online_writer and self.connected:
-                        self.online_writer.write(ka_packet)
-                        await self.online_writer.drain()
+                    self.online_writer.write(ka_packet)
+                    await self.online_writer.drain()
                 except asyncio.CancelledError:
                     break
                 except Exception as e:
-                    if self.connected:
-                        print(f"Bot {self.uid}: Keep-alive error: {e}")
+                    print(f"[{self.uid}] keep-alive error: {e}")
+                    self.connected = False
+                    self.ready_event.clear()
+                    break
         except asyncio.CancelledError:
             pass
 
-    async def handle_disconnect(self):
-        async with self._lock:
-            if not self.connected:
-                return
-            was_spamming = self.spamming
-            saved_target = self.spam_target
-            self.connected = False
-            self.room_opened = False
-            print(f"Bot {self.uid}: Handling disconnect, reconnecting... (was_spamming={was_spamming})")
-            await self.disconnect_tcp()
-            await asyncio.sleep(0.5)
-            # Keep trying to reconnect indefinitely while the session is still valid
-            attempt = 0
-            while True:
-                attempt += 1
-                # If session for the target expired, stop trying
-                if saved_target:
-                    expiry = user_sessions.get(saved_target)
-                    if not expiry or datetime.now() > expiry:
-                        print(f"Bot {self.uid}: Session expired during reconnect, stopping.")
-                        self.spamming = False
-                        return
-                try:
-                    if not self.auth_token:
-                        ok = await self.do_login()
-                        if not ok:
-                            await asyncio.sleep(1)
-                            continue
-                    ok = await self.reconnect_auth()
-                    if not ok:
-                        ok = await self.do_login()
-                        if not ok:
-                            await asyncio.sleep(1)
-                            continue
-                    ok = await self.connect_tcp()
-                    if ok:
-                        print(f"Bot {self.uid}: Reconnected successfully (attempt {attempt})")
-                        try:
-                            await self.open_craftland_room()
-                        except Exception:
-                            pass
-                        # Resume spam if session is still valid
-                        if saved_target:
-                            expiry = user_sessions.get(saved_target)
-                            if expiry and datetime.now() < expiry:
-                                self.spam_target = saved_target
-                                if not self.spamming:
-                                    self.spamming = True
-                                    asyncio.create_task(self.spam_loop())
-                        return
-                except Exception as e:
-                    print(f"Bot {self.uid}: Reconnect attempt {attempt} error: {e}")
-                # Cap attempts at 200 to avoid pathological loops (~ several minutes)
-                if attempt >= 200:
-                    print(f"Bot {self.uid}: Giving up reconnect after {attempt} attempts")
-                    return
-                await asyncio.sleep(1)
-
+    # ---------------- HIGH-LEVEL ----------------
     async def open_craftland_room(self):
         try:
             if not self.connected or not self.online_writer:
@@ -476,11 +471,12 @@ class Bot:
             self.online_writer.write(packet)
             await self.online_writer.drain()
             self.room_opened = True
-            print(f"Bot {self.uid}: Craftland room opened")
-            await asyncio.sleep(0.1)
+            print(f"[{self.uid}] Craftland room opened")
+            await asyncio.sleep(0.15)
             return True
         except Exception as e:
-            print(f"Bot {self.uid}: Error opening room: {e}")
+            print(f"[{self.uid}] open room error: {e}")
+            self.room_opened = False
             return False
 
     async def send_invite(self, target_uid):
@@ -492,178 +488,219 @@ class Bot:
             await self.online_writer.drain()
             return True
         except Exception:
+            self.connected = False
+            self.ready_event.clear()
             return False
 
-    async def spam_loop(self):
+    # ---------------- SUPERVISOR ----------------
+    async def supervisor(self):
         """
-        Continuous spam loop that keeps sending invites for the full 30-minute session.
-        - Does NOT stop on connection drops - waits for reconnect and continues.
-        - Does NOT stop on individual send failures - keeps retrying.
-        - Only stops when: (1) session expires (30 min), (2) target changes/cleared,
-          (3) explicit stop via /xSToP endpoint.
+        FOREVER loop that keeps this bot logged in and TCP-connected.
+        If the socket ever dies (peer close, keep-alive fail, send fail, timeout)
+        it immediately re-logs in and reconnects. Never gives up.
+        The spam loop is running independently and will resume as soon as
+        `ready_event` is set again.
         """
-        self.spamming = True
-        sent = 0
-        failed = 0
-        current_target = self.spam_target
-        print(f"Bot {self.uid}: Spam loop STARTED for target {current_target}")
-        try:
-            # Try to open craftland room once at start
-            if self.connected and not getattr(self, "room_opened", False):
+        backoff = 1.0
+        while True:
+            try:
+                # 1) Make sure we have a valid auth
+                if not self.auth_token:
+                    ok = await self.do_login()
+                else:
+                    ok = await self.refresh_auth()
+                if not ok:
+                    await asyncio.sleep(min(backoff, 5))
+                    backoff = min(backoff * 1.5, 5)
+                    continue
+
+                # 2) Open TCP
+                ok = await self.connect_tcp()
+                if not ok:
+                    await asyncio.sleep(min(backoff, 5))
+                    backoff = min(backoff * 1.5, 5)
+                    continue
+
+                # 3) Open craftland room once (best-effort)
                 try:
                     await self.open_craftland_room()
-                except Exception as e:
-                    print(f"Bot {self.uid}: open_craftland_room error (non-fatal): {e}")
+                except Exception:
+                    pass
 
-            # MAIN LOOP: runs until session expires or stopped
-            while self.spamming and self.spam_target:
-                # If target changed mid-loop, update our reference
-                if self.spam_target != current_target:
-                    current_target = self.spam_target
-                    print(f"Bot {self.uid}: Spam target changed to {current_target}")
+                backoff = 1.0  # reset
 
-                # Check session validity (30-minute window)
-                expiry = user_sessions.get(current_target)
-                if not expiry:
-                    print(f"Bot {self.uid}: No session for {current_target}, stopping.")
-                    break
-                if datetime.now() > expiry:
-                    print(f"Bot {self.uid}: Session for {current_target} expired (30 min done).")
-                    break
+                # 4) Sit here as long as we stay connected
+                while self.connected:
+                    await asyncio.sleep(1)
 
-                # If not connected, WAIT for reconnect - do NOT exit the loop.
-                # handle_disconnect() will restore the connection.
-                if not self.connected or not self.online_writer:
+                # If we exit the inner while, socket died. Loop reconnects.
+                print(f"[{self.uid}] supervisor: socket lost, reconnecting immediately...")
+                await self.disconnect_tcp()
+                await asyncio.sleep(0.3)
+
+            except asyncio.CancelledError:
+                print(f"[{self.uid}] supervisor cancelled")
+                await self.disconnect_tcp()
+                return
+            except Exception as e:
+                print(f"[{self.uid}] supervisor error: {e}")
+                traceback.print_exc()
+                await asyncio.sleep(1)
+
+    # ---------------- SPAM ----------------
+    async def spam_loop_forever(self):
+        """
+        FOREVER loop for the whole life of this bot.
+        Sends invites whenever:
+          - self.spam_target is set
+          - user_sessions[spam_target] is in the future
+          - self.connected is True
+        Otherwise, it just waits (never exits). This guarantees that:
+          1. A /xAyOuB call causes continuous spam for 30 minutes.
+          2. If the socket drops mid-session, the loop pauses briefly
+             and RESUMES automatically once the supervisor reconnects.
+          3. When the 30 minute window ends, sending stops – but the loop
+             stays alive, ready for the NEXT /xAyOuB call.
+        """
+        print(f"[{self.uid}] spam_loop_forever started (idle, waiting for target)")
+        while True:
+            try:
+                target = self.spam_target
+                if not target:
+                    await asyncio.sleep(0.5)
+                    continue
+                expiry = user_sessions.get(target)
+                if not expiry or datetime.now() >= expiry:
+                    # session ended; clear target so we don't spin
+                    if self.spam_target == target:
+                        self.spam_target = None
                     await asyncio.sleep(0.5)
                     continue
 
-                # Try to reopen room if it was closed after reconnect
-                if not getattr(self, "room_opened", False):
+                # Wait for a ready connection (never exit)
+                if not self.connected or not self.online_writer:
+                    try:
+                        await asyncio.wait_for(self.ready_event.wait(), timeout=2)
+                    except asyncio.TimeoutError:
+                        continue
+
+                # Ensure the craftland room is open
+                if not self.room_opened:
                     try:
                         await self.open_craftland_room()
                     except Exception:
                         pass
 
-                # Optimized sending: fast batching
+                # Fast batch send
                 batch_ok = 0
                 for _ in range(20):
-                    if not self.spamming or not self.spam_target:
+                    if self.spam_target != target:
                         break
-                    # Re-check session inside batch too
-                    expiry = user_sessions.get(current_target)
-                    if not expiry or datetime.now() > expiry:
+                    exp2 = user_sessions.get(target)
+                    if not exp2 or datetime.now() >= exp2:
                         break
                     if not self.connected or not self.online_writer:
                         break
-                    try:
-                        ok = await self.send_invite(current_target)
-                        if ok:
-                            sent += 1
-                            batch_ok += 1
-                        else:
-                            failed += 1
-                    except Exception as e:
-                        failed += 1
-                        # Do not break - keep the loop alive
-                        if failed % 50 == 0:
-                            print(f"Bot {self.uid}: send_invite failing ({failed} fails so far): {e}")
+                    ok = await self.send_invite(target)
+                    if ok:
+                        self.total_sent += 1
+                        batch_ok += 1
+                        self.last_send_ts = time.time()
+                    else:
+                        self.total_failed += 1
+                        break
                     await asyncio.sleep(0.005)
 
-                # If a whole batch produced 0 sends, back off slightly to avoid CPU spin
                 if batch_ok == 0:
+                    # small backoff while disconnected / server rate-limits
                     await asyncio.sleep(0.2)
                 else:
-                    await asyncio.sleep(0.05)
+                    await asyncio.sleep(0.03)
 
-        except asyncio.CancelledError:
-            print(f"Bot {self.uid}: Spam loop cancelled")
-        except Exception as e:
-            print(f"Bot {self.uid}: Spam loop fatal error: {e}")
-            # Even on fatal error, try to restart the loop if session is still valid
-            try:
-                expiry = user_sessions.get(self.spam_target) if self.spam_target else None
-                if expiry and datetime.now() < expiry and self.spam_target:
-                    print(f"Bot {self.uid}: Restarting spam loop after fatal error")
-                    await asyncio.sleep(1)
-                    asyncio.create_task(self.spam_loop())
-                    return
-            except Exception:
-                pass
-        finally:
-            self.spamming = False
-            print(f"Bot {self.uid}: Spam stopped for {current_target}, sent={sent}, failed={failed}")
+            except asyncio.CancelledError:
+                print(f"[{self.uid}] spam_loop_forever cancelled")
+                return
+            except Exception as e:
+                print(f"[{self.uid}] spam_loop_forever error: {e}")
+                await asyncio.sleep(0.5)
 
+
+# ============================================================
+#                        FLASK API
+# ============================================================
 @app.route("/", methods=["GET"])
 def root_endpoint():
     return jsonify({"status": "active", "api_name": "x-ayoub-panel-x-Team"}), 200
+
 
 @app.route("/ping", methods=["GET"])
 def ping_endpoint():
     return jsonify({"status": "alive", "ts": datetime.now().isoformat()}), 200
 
+
 @app.route("/x-ayoub-panel-x-Team", methods=["GET"])
 def x_ayoub_panel_x_Team_endpoint():
-    # Placeholder for general info or status
     return jsonify({"status": "active", "api_name": "x-ayoub-panel-x-Team"}), 200
+
 
 @app.route("/xAyOuB", methods=["GET"])
 def x_ayoub_endpoint():
-    global loop
     target_uid = request.args.get("uid")
     if not target_uid:
         return jsonify({"status": "error", "message": "Missing uid parameter"}), 400
-    
-    # Set 30 minutes session
+
+    # Set/refresh 30 minutes session
     user_sessions[target_uid] = datetime.now() + timedelta(minutes=30)
-    
+
     online_bots = [b for b in bots.values() if b.connected]
-    if not online_bots:
-        return jsonify({"status": "error", "message": "No bots online"}), 503
-    
-    started = 0
+
+    # Assign target to ALL bots (both connected and reconnecting).
+    # Their spam_loop_forever will pick it up whenever their socket comes back.
     for bot in bots.values():
         bot.spam_target = target_uid
-        # Only start a NEW loop if one is not already running for this bot.
-        # If it is already spamming (possibly on an old target), setting spam_target
-        # above is enough - the existing loop will pick up the new target on next iteration.
-        if bot.connected and not bot.spamming:
-            bot.spamming = True
-            asyncio.run_coroutine_threadsafe(bot.spam_loop(), loop)
-            started += 1
-            
+
     return jsonify({
         "status": "ok",
-        "message": "Started for 30 minutes",
+        "message": "Started for 30 minutes (bots will send continuously; auto-reconnect if disconnected)",
         "target_uid": target_uid,
+        "total_bots": len(bots),
         "online_bots": len(online_bots),
-        "loops_started": started,
         "session_expires": user_sessions[target_uid].isoformat()
     }), 200
+
 
 @app.route("/xSToP", methods=["GET"])
 def x_stop_endpoint():
     target_uid = request.args.get("uid")
     if target_uid in user_sessions:
         del user_sessions[target_uid]
-    
     for bot in bots.values():
         if bot.spam_target == target_uid:
-            bot.spamming = False
-            
+            bot.spam_target = None
     return jsonify({"status": "ok", "message": f"Stopped for {target_uid}"}), 200
+
 
 @app.route("/status", methods=["GET"])
 def status_endpoint():
-    result = {}
+    now = datetime.now()
+    sessions = {k: {"expires": v.isoformat(), "remaining_seconds": max(0, int((v - now).total_seconds()))}
+                for k, v in user_sessions.items()}
+    result = {"sessions": sessions, "bots": {}}
     for uid, bot in bots.items():
-        result[uid] = {
+        result["bots"][uid] = {
             "connected": bot.connected,
-            "spamming": bot.spamming,
             "target": bot.spam_target,
-            "name": bot.account_name
+            "name": bot.account_name,
+            "sent": bot.total_sent,
+            "failed": bot.total_failed,
+            "last_send_ago_s": (int(time.time() - bot.last_send_ts) if bot.last_send_ts else None),
         }
     return jsonify(result), 200
 
+
+# ============================================================
+#                     ORCHESTRATION
+# ============================================================
 async def load_accs(filename="accs.txt"):
     accounts = []
     try:
@@ -684,30 +721,6 @@ async def load_accs(filename="accs.txt"):
         print(f"Error loading accs.txt: {e}")
     return accounts
 
-async def start_bot(bot):
-    try:
-        print(f"Starting bot {bot.uid}")
-        ok = await bot.do_login()
-        if not ok:
-            return False
-        ok = await bot.connect_tcp()
-        if not ok:
-            return False
-        await asyncio.sleep(0.1)
-        await bot.open_craftland_room()
-        return True
-    except Exception as e:
-        print(f"Bot {bot.uid}: Start error: {e}")
-        return False
-
-async def ensure_all_bots_online():
-    while True:
-        offline_bots = [bot for bot in bots.values() if not bot.connected]
-        if not offline_bots:
-            break
-        tasks = [start_bot(bot) for bot in offline_bots]
-        await asyncio.gather(*tasks, return_exceptions=True)
-        await asyncio.sleep(10)
 
 def run_flask():
     from werkzeug.serving import make_server
@@ -716,10 +729,11 @@ def run_flask():
     print(f"Flask API running on port {port}")
     srv.serve_forever()
 
+
 def keep_alive_worker():
     """Self-ping every 50 seconds to prevent Render free tier from sleeping."""
     import requests as _rq
-    time.sleep(15)  # wait for server to boot
+    time.sleep(15)
     port = int(os.environ.get("PORT", 5000))
     external_url = os.environ.get("RENDER_EXTERNAL_URL", f"http://127.0.0.1:{port}")
     ping_url = external_url.rstrip("/") + "/ping"
@@ -731,31 +745,38 @@ def keep_alive_worker():
             print(f"[keep-alive] error: {e}")
         time.sleep(50)
 
+
 async def main():
     global loop
     loop = asyncio.get_running_loop()
-    accounts = await load_accs("accs.txt")
-    if not accounts:
-        print("No accounts found")
-        # still start flask so the web service stays alive on Render
-        flask_thread = Thread(target=run_flask, daemon=True)
-        flask_thread.start()
-        Thread(target=keep_alive_worker, daemon=True).start()
-        while True:
-            await asyncio.sleep(3600)
-        return
-    for uid, password in accounts:
-        bot = Bot(uid, password)
-        bots[uid] = bot
 
+    # Start Flask + self-ping ASAP so Render sees the port bound quickly
     flask_thread = Thread(target=run_flask, daemon=True)
     flask_thread.start()
     Thread(target=keep_alive_worker, daemon=True).start()
-    
-    await ensure_all_bots_online()
-    
+
+    accounts = await load_accs("accs.txt")
+    if not accounts:
+        print("No accounts found in accs.txt, staying alive as web service.")
+        while True:
+            await asyncio.sleep(3600)
+        return
+
+    # Instantiate bots and start their supervisor + spam loops
+    for uid, password in accounts:
+        bot = Bot(uid, password)
+        bots[uid] = bot
+        # The supervisor keeps the bot logged-in & connected FOREVER
+        bot.supervisor_task = asyncio.create_task(bot.supervisor())
+        # The spam loop runs FOREVER too, but only actually sends when
+        # spam_target + valid session + connected.
+        bot.spam_task = asyncio.create_task(bot.spam_loop_forever())
+
+    print(f"Launched {len(bots)} bots with permanent supervisors + spam loops.")
+
     while True:
         await asyncio.sleep(3600)
+
 
 if __name__ == "__main__":
     try:
