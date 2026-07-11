@@ -496,47 +496,40 @@ class Bot:
     async def supervisor(self):
         """
         FOREVER loop that keeps this bot logged in and TCP-connected.
-        If the socket ever dies (peer close, keep-alive fail, send fail, timeout)
-        it immediately re-logs in and reconnects. Never gives up.
-        The spam loop is running independently and will resume as soon as
-        `ready_event` is set again.
+        Reconnects IMMEDIATELY whenever the socket dies, so the spam loop
+        can resume without losing its 30-minute session window.
         """
-        backoff = 1.0
+        backoff = 0.5
         while True:
             try:
-                # 1) Make sure we have a valid auth
                 if not self.auth_token:
                     ok = await self.do_login()
                 else:
                     ok = await self.refresh_auth()
                 if not ok:
-                    await asyncio.sleep(min(backoff, 5))
-                    backoff = min(backoff * 1.5, 5)
+                    await asyncio.sleep(min(backoff, 3))
+                    backoff = min(backoff * 1.5, 3)
                     continue
 
-                # 2) Open TCP
                 ok = await self.connect_tcp()
                 if not ok:
-                    await asyncio.sleep(min(backoff, 5))
-                    backoff = min(backoff * 1.5, 5)
+                    await asyncio.sleep(min(backoff, 3))
+                    backoff = min(backoff * 1.5, 3)
                     continue
 
-                # 3) Open craftland room once (best-effort)
                 try:
                     await self.open_craftland_room()
                 except Exception:
                     pass
 
-                backoff = 1.0  # reset
+                backoff = 0.5
 
-                # 4) Sit here as long as we stay connected
                 while self.connected:
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(0.5)
 
-                # If we exit the inner while, socket died. Loop reconnects.
-                print(f"[{self.uid}] supervisor: socket lost, reconnecting immediately...")
+                print(f"[{self.uid}] supervisor: socket lost, reconnecting NOW...")
                 await self.disconnect_tcp()
-                await asyncio.sleep(0.3)
+                # No wait: reconnect immediately so spam resumes right away.
 
             except asyncio.CancelledError:
                 print(f"[{self.uid}] supervisor cancelled")
@@ -545,42 +538,36 @@ class Bot:
             except Exception as e:
                 print(f"[{self.uid}] supervisor error: {e}")
                 traceback.print_exc()
-                await asyncio.sleep(1)
+                await asyncio.sleep(0.5)
 
     # ---------------- SPAM ----------------
     async def spam_loop_forever(self):
         """
-        FOREVER loop for the whole life of this bot.
-        Sends invites whenever:
+        FOREVER loop. Sends ONE invite every 3-10 seconds while:
           - self.spam_target is set
-          - user_sessions[spam_target] is in the future
-          - self.connected is True
-        Otherwise, it just waits (never exits). This guarantees that:
-          1. A /xAyOuB call causes continuous spam for 30 minutes.
-          2. If the socket drops mid-session, the loop pauses briefly
-             and RESUMES automatically once the supervisor reconnects.
-          3. When the 30 minute window ends, sending stops – but the loop
-             stays alive, ready for the NEXT /xAyOuB call.
+          - user_sessions[spam_target] is still in the future (<= 30 min window)
+          - self.connected is True (else waits for reconnect, then resumes)
+        On disconnect: waits for the supervisor to reconnect, then resumes
+        sending IMMEDIATELY without losing the target or the session window.
         """
         print(f"[{self.uid}] spam_loop_forever started (idle, waiting for target)")
         while True:
             try:
                 target = self.spam_target
                 if not target:
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(0.3)
                     continue
                 expiry = user_sessions.get(target)
                 if not expiry or datetime.now() >= expiry:
-                    # session ended; clear target so we don't spin
                     if self.spam_target == target:
                         self.spam_target = None
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(0.3)
                     continue
 
-                # Wait for a ready connection (never exit)
+                # Wait until connection is ready (supervisor handles reconnect)
                 if not self.connected or not self.online_writer:
                     try:
-                        await asyncio.wait_for(self.ready_event.wait(), timeout=2)
+                        await asyncio.wait_for(self.ready_event.wait(), timeout=3)
                     except asyncio.TimeoutError:
                         continue
 
@@ -591,31 +578,27 @@ class Bot:
                     except Exception:
                         pass
 
-                # Fast batch send
-                batch_ok = 0
-                for _ in range(20):
-                    if self.spam_target != target:
-                        break
-                    exp2 = user_sessions.get(target)
-                    if not exp2 or datetime.now() >= exp2:
-                        break
-                    if not self.connected or not self.online_writer:
-                        break
-                    ok = await self.send_invite(target)
-                    if ok:
-                        self.total_sent += 1
-                        batch_ok += 1
-                        self.last_send_ts = time.time()
-                    else:
-                        self.total_failed += 1
-                        break
-                    await asyncio.sleep(0.005)
-
-                if batch_ok == 0:
-                    # small backoff while disconnected / server rate-limits
-                    await asyncio.sleep(0.2)
+                # Send ONE invite, then wait a short random gap (3-10s).
+                ok = await self.send_invite(target)
+                if ok:
+                    self.total_sent += 1
+                    self.last_send_ts = time.time()
+                    delay = random.uniform(3.0, 10.0)
+                    # Sleep in small chunks so target change / expiry / disconnect
+                    # is detected quickly.
+                    end_at = time.time() + delay
+                    while time.time() < end_at:
+                        if self.spam_target != target:
+                            break
+                        exp2 = user_sessions.get(target)
+                        if not exp2 or datetime.now() >= exp2:
+                            break
+                        await asyncio.sleep(0.25)
                 else:
-                    await asyncio.sleep(0.03)
+                    self.total_failed += 1
+                    # send failed => socket likely dead; loop back and wait
+                    # for supervisor to reconnect, then continue.
+                    await asyncio.sleep(0.3)
 
             except asyncio.CancelledError:
                 print(f"[{self.uid}] spam_loop_forever cancelled")
