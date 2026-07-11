@@ -4,7 +4,7 @@ pycryptodome==3.19.0
 protobuf==4.25.1
 requests==2.31.0
 werkzeug==3.0.1
-protobuf-decoder==0.1.1
+protobuf-decoder==0.4.0
 psutil==5.9.6
 PyJWT==2.8.0
 urllib3==2.1.0
