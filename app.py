@@ -414,11 +414,24 @@ class Bot:
         async with self._lock:
             if not self.connected:
                 return
+            was_spamming = self.spamming
+            saved_target = self.spam_target
             self.connected = False
-            print(f"Bot {self.uid}: Handling disconnect, reconnecting...")
+            self.room_opened = False
+            print(f"Bot {self.uid}: Handling disconnect, reconnecting... (was_spamming={was_spamming})")
             await self.disconnect_tcp()
             await asyncio.sleep(0.5)
-            for attempt in range(20):
+            # Keep trying to reconnect indefinitely while the session is still valid
+            attempt = 0
+            while True:
+                attempt += 1
+                # If session for the target expired, stop trying
+                if saved_target:
+                    expiry = user_sessions.get(saved_target)
+                    if not expiry or datetime.now() > expiry:
+                        print(f"Bot {self.uid}: Session expired during reconnect, stopping.")
+                        self.spamming = False
+                        return
                 try:
                     if not self.auth_token:
                         ok = await self.do_login()
@@ -433,16 +446,27 @@ class Bot:
                             continue
                     ok = await self.connect_tcp()
                     if ok:
-                        print(f"Bot {self.uid}: Reconnected successfully")
-                        await self.open_craftland_room()
-                        if self.spam_target:
-                            self.spamming = True
-                            asyncio.create_task(self.spam_loop())
+                        print(f"Bot {self.uid}: Reconnected successfully (attempt {attempt})")
+                        try:
+                            await self.open_craftland_room()
+                        except Exception:
+                            pass
+                        # Resume spam if session is still valid
+                        if saved_target:
+                            expiry = user_sessions.get(saved_target)
+                            if expiry and datetime.now() < expiry:
+                                self.spam_target = saved_target
+                                if not self.spamming:
+                                    self.spamming = True
+                                    asyncio.create_task(self.spam_loop())
                         return
                 except Exception as e:
-                    print(f"Bot {self.uid}: Reconnect attempt {attempt+1} error: {e}")
+                    print(f"Bot {self.uid}: Reconnect attempt {attempt} error: {e}")
+                # Cap attempts at 200 to avoid pathological loops (~ several minutes)
+                if attempt >= 200:
+                    print(f"Bot {self.uid}: Giving up reconnect after {attempt} attempts")
+                    return
                 await asyncio.sleep(1)
-            print(f"Bot {self.uid}: Failed to reconnect after 20 attempts")
 
     async def open_craftland_room(self):
         try:
@@ -471,38 +495,103 @@ class Bot:
             return False
 
     async def spam_loop(self):
+        """
+        Continuous spam loop that keeps sending invites for the full 30-minute session.
+        - Does NOT stop on connection drops - waits for reconnect and continues.
+        - Does NOT stop on individual send failures - keeps retrying.
+        - Only stops when: (1) session expires (30 min), (2) target changes/cleared,
+          (3) explicit stop via /xSToP endpoint.
+        """
         self.spamming = True
         sent = 0
+        failed = 0
+        current_target = self.spam_target
+        print(f"Bot {self.uid}: Spam loop STARTED for target {current_target}")
         try:
-            if not getattr(self, "room_opened", False):
-                await self.open_craftland_room()
+            # Try to open craftland room once at start
+            if self.connected and not getattr(self, "room_opened", False):
+                try:
+                    await self.open_craftland_room()
+                except Exception as e:
+                    print(f"Bot {self.uid}: open_craftland_room error (non-fatal): {e}")
+
+            # MAIN LOOP: runs until session expires or stopped
             while self.spamming and self.spam_target:
-                # Check session validity
-                expiry = user_sessions.get(self.spam_target)
-                if not expiry or datetime.now() > expiry:
-                    print(f"Session for {self.spam_target} expired or not found.")
+                # If target changed mid-loop, update our reference
+                if self.spam_target != current_target:
+                    current_target = self.spam_target
+                    print(f"Bot {self.uid}: Spam target changed to {current_target}")
+
+                # Check session validity (30-minute window)
+                expiry = user_sessions.get(current_target)
+                if not expiry:
+                    print(f"Bot {self.uid}: No session for {current_target}, stopping.")
+                    break
+                if datetime.now() > expiry:
+                    print(f"Bot {self.uid}: Session for {current_target} expired (30 min done).")
                     break
 
-                if not self.connected:
-                    await asyncio.sleep(0.1)
+                # If not connected, WAIT for reconnect - do NOT exit the loop.
+                # handle_disconnect() will restore the connection.
+                if not self.connected or not self.online_writer:
+                    await asyncio.sleep(0.5)
                     continue
-                
-                # Optimized sending: faster batching
+
+                # Try to reopen room if it was closed after reconnect
+                if not getattr(self, "room_opened", False):
+                    try:
+                        await self.open_craftland_room()
+                    except Exception:
+                        pass
+
+                # Optimized sending: fast batching
+                batch_ok = 0
                 for _ in range(20):
-                    if not self.spamming or not self.connected:
+                    if not self.spamming or not self.spam_target:
                         break
-                    ok = await self.send_invite(self.spam_target)
-                    if ok:
-                        sent += 1
-                    # Minimal sleep for continuous flow
+                    # Re-check session inside batch too
+                    expiry = user_sessions.get(current_target)
+                    if not expiry or datetime.now() > expiry:
+                        break
+                    if not self.connected or not self.online_writer:
+                        break
+                    try:
+                        ok = await self.send_invite(current_target)
+                        if ok:
+                            sent += 1
+                            batch_ok += 1
+                        else:
+                            failed += 1
+                    except Exception as e:
+                        failed += 1
+                        # Do not break - keep the loop alive
+                        if failed % 50 == 0:
+                            print(f"Bot {self.uid}: send_invite failing ({failed} fails so far): {e}")
                     await asyncio.sleep(0.005)
-                await asyncio.sleep(0.05)
+
+                # If a whole batch produced 0 sends, back off slightly to avoid CPU spin
+                if batch_ok == 0:
+                    await asyncio.sleep(0.2)
+                else:
+                    await asyncio.sleep(0.05)
+
         except asyncio.CancelledError:
-            pass
+            print(f"Bot {self.uid}: Spam loop cancelled")
         except Exception as e:
-            print(f"Bot {self.uid}: Spam loop error: {e}")
-        self.spamming = False
-        print(f"Bot {self.uid}: Spam stopped for {self.spam_target}, total sent: {sent}")
+            print(f"Bot {self.uid}: Spam loop fatal error: {e}")
+            # Even on fatal error, try to restart the loop if session is still valid
+            try:
+                expiry = user_sessions.get(self.spam_target) if self.spam_target else None
+                if expiry and datetime.now() < expiry and self.spam_target:
+                    print(f"Bot {self.uid}: Restarting spam loop after fatal error")
+                    await asyncio.sleep(1)
+                    asyncio.create_task(self.spam_loop())
+                    return
+            except Exception:
+                pass
+        finally:
+            self.spamming = False
+            print(f"Bot {self.uid}: Spam stopped for {current_target}, sent={sent}, failed={failed}")
 
 @app.route("/", methods=["GET"])
 def root_endpoint():
@@ -531,17 +620,24 @@ def x_ayoub_endpoint():
     if not online_bots:
         return jsonify({"status": "error", "message": "No bots online"}), 503
     
+    started = 0
     for bot in bots.values():
         bot.spam_target = target_uid
-        if not bot.spamming and bot.connected:
+        # Only start a NEW loop if one is not already running for this bot.
+        # If it is already spamming (possibly on an old target), setting spam_target
+        # above is enough - the existing loop will pick up the new target on next iteration.
+        if bot.connected and not bot.spamming:
             bot.spamming = True
             asyncio.run_coroutine_threadsafe(bot.spam_loop(), loop)
+            started += 1
             
     return jsonify({
         "status": "ok",
         "message": "Started for 30 minutes",
         "target_uid": target_uid,
-        "online_bots": len(online_bots)
+        "online_bots": len(online_bots),
+        "loops_started": started,
+        "session_expires": user_sessions[target_uid].isoformat()
     }), 200
 
 @app.route("/xSToP", methods=["GET"])
