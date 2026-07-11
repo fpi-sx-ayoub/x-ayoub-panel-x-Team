@@ -504,6 +504,14 @@ class Bot:
         self.spamming = False
         print(f"Bot {self.uid}: Spam stopped for {self.spam_target}, total sent: {sent}")
 
+@app.route("/", methods=["GET"])
+def root_endpoint():
+    return jsonify({"status": "active", "api_name": "x-ayoub-panel-x-Team"}), 200
+
+@app.route("/ping", methods=["GET"])
+def ping_endpoint():
+    return jsonify({"status": "alive", "ts": datetime.now().isoformat()}), 200
+
 @app.route("/x-ayoub-panel-x-Team", methods=["GET"])
 def x_ayoub_panel_x_Team_endpoint():
     # Placeholder for general info or status
@@ -612,12 +620,33 @@ def run_flask():
     print(f"Flask API running on port {port}")
     srv.serve_forever()
 
+def keep_alive_worker():
+    """Self-ping every 50 seconds to prevent Render free tier from sleeping."""
+    import requests as _rq
+    time.sleep(15)  # wait for server to boot
+    port = int(os.environ.get("PORT", 5000))
+    external_url = os.environ.get("RENDER_EXTERNAL_URL", f"http://127.0.0.1:{port}")
+    ping_url = external_url.rstrip("/") + "/ping"
+    while True:
+        try:
+            r = _rq.get(ping_url, timeout=10)
+            print(f"[keep-alive] {ping_url} -> {r.status_code}")
+        except Exception as e:
+            print(f"[keep-alive] error: {e}")
+        time.sleep(50)
+
 async def main():
     global loop
     loop = asyncio.get_running_loop()
     accounts = await load_accs("accs.txt")
     if not accounts:
         print("No accounts found")
+        # still start flask so the web service stays alive on Render
+        flask_thread = Thread(target=run_flask, daemon=True)
+        flask_thread.start()
+        Thread(target=keep_alive_worker, daemon=True).start()
+        while True:
+            await asyncio.sleep(3600)
         return
     for uid, password in accounts:
         bot = Bot(uid, password)
@@ -625,6 +654,7 @@ async def main():
 
     flask_thread = Thread(target=run_flask, daemon=True)
     flask_thread.start()
+    Thread(target=keep_alive_worker, daemon=True).start()
     
     await ensure_all_bots_online()
     
